@@ -23,7 +23,7 @@ def chat(prompt: str, max_tokens: int = 2048, timeout: int = 120) -> str:
     try:
         with _CLAUDE_LOCK:
             result = subprocess.run(
-                [_CLAUDE_PATH, "-p", "--output-format", "text"],
+                [_CLAUDE_PATH, "-p", "--output-format", "text", "--system", "You are a helpful assistant."],
                 input=prompt,
                 capture_output=True,
                 text=True,

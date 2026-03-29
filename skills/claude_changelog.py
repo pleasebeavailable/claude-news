@@ -148,7 +148,7 @@ def process_sync() -> None:
     """Process unnotified entries and send Telegram digest."""
     with _conn() as conn:
         entries = conn.execute(
-            "SELECT * FROM changelog_entries WHERE notified=0 ORDER BY date DESC"
+            "SELECT * FROM changelog_entries WHERE notified=0 AND category != 'skipped' ORDER BY date DESC"
         ).fetchall()
         releases = conn.execute(
             "SELECT * FROM github_releases WHERE notified=0 ORDER BY published_at DESC"
@@ -168,14 +168,21 @@ def process_sync() -> None:
         icon = _source_icon(row["source"])
         date = _entry_date(row)
         title = _escape_md(row["title"])
-        lines.append(f"{icon} [{date}] {title}")
+        summary = ""
+        if row["summary"]:
+            summary = "\n  _" + _escape_md(row["summary"][:180]) + "_"
+        lines.append(f"{icon} *{title}*{summary}")
         shown += 1
 
     for row in releases[:max(0, _MAX_DIGEST - shown)]:
         date = (row["published_at"] or "")[:10]
         repo = row["repo"].split("/")[-1]
         tag = _escape_md(row["tag"])
-        lines.append(f"\U0001f527 [{date}] {_escape_md(repo)} {tag}")
+        body = ""
+        if row["body"]:
+            first_line = row["body"].strip().splitlines()[0][:180]
+            body = "\n  _" + _escape_md(first_line) + "_"
+        lines.append(f"\U0001f527 *{_escape_md(repo)} {tag}* `{date}`{body}")
         shown += 1
 
     remaining = total - shown
@@ -206,7 +213,7 @@ def get_changelog() -> str:
     """On-demand: show recent entries from knowledge base."""
     with _conn() as conn:
         entries = conn.execute(
-            "SELECT * FROM changelog_entries ORDER BY date DESC, fetched_at DESC LIMIT 10"
+            "SELECT * FROM changelog_entries WHERE category != 'skipped' ORDER BY date DESC, fetched_at DESC LIMIT 10"
         ).fetchall()
         releases = conn.execute(
             "SELECT * FROM github_releases ORDER BY published_at DESC LIMIT 5"
@@ -221,12 +228,11 @@ def get_changelog() -> str:
         lines.append("")
         for row in entries:
             icon = _source_icon(row["source"])
-            date = _entry_date(row)
             title = _escape_md(row["title"])
             summary = ""
             if row["summary"]:
-                summary = "\n  " + _escape_md(row["summary"][:150])
-            lines.append(f"{icon} [{date}] *{title}*{summary}")
+                summary = "\n  _" + _escape_md(row["summary"][:180]) + "_"
+            lines.append(f"{icon} *{title}*{summary}")
 
     if releases:
         lines.append("\n\U0001f527 *Releases*")
@@ -234,7 +240,11 @@ def get_changelog() -> str:
             repo = row["repo"].split("/")[-1]
             tag = _escape_md(row["tag"])
             date = (row["published_at"] or "")[:10]
-            lines.append(f"  [{date}] {_escape_md(repo)} {tag}")
+            body = ""
+            if row["body"]:
+                first_line = row["body"].strip().splitlines()[0][:180]
+                body = "\n  _" + _escape_md(first_line) + "_"
+            lines.append(f"  `{date}` {_escape_md(repo)} {tag}{body}")
 
     return _truncate("\n".join(lines))
 
