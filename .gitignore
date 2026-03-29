@@ -1,8 +1,40 @@
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment & secrets
 .env
+.env.local
+*.secret
+
+# Runtime data (generated at runtime)
 data/
 logs/
 *.log
+*.lock
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Scripts (local utility scripts, not committed)
 scripts/
