@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Start Claude Intel bot (single instance via lock file)
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+LOCK_FILE="/tmp/claude-intel.lock"
+PID_FILE="/tmp/claude-intel.pid"
+LOG_DIR="$PROJECT_DIR/logs"
+
+mkdir -p "$LOG_DIR"
+
+# Check if already running
+if [ -f "$PID_FILE" ]; then
+    PID=$(cat "$PID_FILE")
+    if kill -0 "$PID" 2>/dev/null; then
+        echo "Claude Intel is already running (PID=$PID)"
+        exit 1
+    else
+        rm -f "$PID_FILE"
+    fi
+fi
+
+# Check .env exists
+if [ ! -f "$PROJECT_DIR/.env" ]; then
+    echo "Error: .env not found. Copy .env.example and fill in your credentials."
+    exit 1
+fi
+
+# Check claude CLI
+if ! command -v claude &>/dev/null; then
+    echo "Warning: 'claude' CLI not found in PATH — free-form chat will be unavailable"
+fi
+
+echo "Starting Claude Intel..."
+cd "$PROJECT_DIR"
+nohup python3 main.py >> "$LOG_DIR/app.log" 2>&1 &
+echo $! > "$PID_FILE"
+echo "Started (PID=$(cat $PID_FILE)) — logs at $LOG_DIR/app.log"

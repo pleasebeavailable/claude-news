@@ -1,0 +1,12 @@
+Today is {today}. The user wants to understand: "{feature}"
+
+Here are relevant Claude/Anthropic capabilities and updates:
+{entries}
+
+Explain:
+1. What this feature/update does
+2. Who benefits most (developers, enterprises, individuals)
+3. 2-3 concrete use cases with brief examples
+4. Any limitations or things to watch out for
+
+Keep it under 300 words. Be practical and specific.
