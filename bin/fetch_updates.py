@@ -9,6 +9,7 @@ import hashlib
 import logging
 import re
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -23,31 +24,55 @@ TRIGGER_PATH = ROOT / "data" / ".sync_trigger"
 LAST_FETCH_PATH = ROOT / "data" / ".last_fetch_time"
 LOG_PATH = ROOT / "logs" / "fetch.log"
 
-# ── Sources ───────────────────────────────────────────────────────────────
+# ── Sources ────────────────────────────────────────────────────────────────
 GITHUB_REPOS = [
     "anthropics/claude-code",
     "anthropics/anthropic-sdk-python",
     "anthropics/anthropic-sdk-typescript",
     "modelcontextprotocol/python-sdk",
     "modelcontextprotocol/typescript-sdk",
+    "modelcontextprotocol/servers",
     "anthropics/anthropic-cookbook",
 ]
 
-DOCS_URLS = [
-    "https://docs.anthropic.com/en/release-notes/overview",
+# API release notes — parsed as structured dated entries (not hash-compared)
+RELEASE_NOTE_URLS = [
     "https://docs.anthropic.com/en/release-notes/api",
-    "https://docs.anthropic.com/en/release-notes/claude-code",
 ]
 
+STATUS_API = "https://status.anthropic.com/api/v2/incidents/unresolved.json"
 SITEMAP_URL = "https://www.anthropic.com/sitemap.xml"
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 }
-
-REQUEST_TIMEOUT = 20
 HEADERS = {"User-Agent": "claude-intel-bot/1.0 (+github.com/anthropics)"}
+REQUEST_TIMEOUT = 20
 
-# ── Logging ───────────────────────────────────────────────────────────────
+# Positive: slug must match at least one (checked case-insensitively)
+_RELEVANT_KEYWORDS = [
+    "claude", "sonnet", "opus", "haiku", "mcp", "model-context-protocol",
+    "tool-use", "computer-use", "artifact", "operator", "claude-code", "claude-desktop",
+    "extended-thinking", "vision", "multimodal",
+]
+
+# Negative: if ANY of these appear in slug OR title, skip the article
+_SKIP_PATTERNS = [
+    "chooses", "selects", "powers customer", "powers llnl", "increases productivity",
+    "partner network", "economic index", "branches of government", "fedramp",
+    "il4", "il5", "for nonprofits", "for life sciences", "for financial services",
+    "for enterprise", "investment in", "invests", "expands to", "comes to",
+    "joins", "available in brazil", "available in canada", "available in the eu",
+    "available in the uk", "case study",
+]
+
+# Release body patterns that indicate a breaking/important change
+_BREAKING_PATTERNS = [
+    "breaking change", "breaking:", "breaking -", "deprecated", "deprecation",
+    "migration required", "removed ", "incompatible",
+]
+
+# ── Logging ────────────────────────────────────────────────────────────────
 LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -60,7 +85,7 @@ logging.basicConfig(
 log = logging.getLogger("fetch_updates")
 
 
-# ── DB helpers ────────────────────────────────────────────────────────────
+# ── DB helpers ─────────────────────────────────────────────────────────────
 
 def _conn() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -75,7 +100,69 @@ def _hash(*parts: str) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
-# ── GitHub releases ───────────────────────────────────────────────────────
+# ── LLM summarization ──────────────────────────────────────────────────────
+
+def _llm_summarize(context: str, body: str) -> str | None:
+    """Ask Claude to produce a 1-sentence developer-impact summary of release notes."""
+    if not body or len(body.strip()) < 80:
+        return None
+    prompt = (
+        f"Release notes for: {context}\n\n"
+        f"{body[:1500]}\n\n"
+        f"Write exactly 1 sentence (max 20 words) describing the developer impact. "
+        f"Be specific: name new commands/features, breaking changes, or key fixes. "
+        f"No filler phrases like 'this release includes'."
+    )
+    try:
+        result = subprocess.run(
+            ["claude", "-p", "--output-format", "text"],
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            summary = result.stdout.strip()
+            # Keep only the first sentence
+            first = re.split(r"(?<=[.!?])\s", summary)[0].strip()
+            return first if first else None
+    except Exception as e:
+        log.warning("LLM summarize failed (%s): %s", context, e)
+    return None
+
+
+# ── Urgency classification ─────────────────────────────────────────────────
+
+def _release_urgency(repo: str, tag: str, body: str) -> str:
+    """Return 'A' for Tier A (send individually), 'B' for digest."""
+    # claude-code is always Tier A — user uses it every day
+    if repo == "anthropics/claude-code":
+        return "A"
+    body_lower = (body or "").lower()
+    if any(p in body_lower for p in _BREAKING_PATTERNS):
+        return "A"
+    # Major version bump (vN.0.0)
+    if re.match(r"v?\d+\.0\.0$", tag):
+        return "A"
+    return "B"
+
+
+def _entry_urgency(source: str, content: str) -> str:
+    """Return 'A' for release note entries that describe new models or breaking changes."""
+    c = content.lower()
+    if source == "status":
+        return "A"
+    if any(p in c for p in ["breaking", "deprecated", "migration required"]):
+        return "A"
+    # New model announcement
+    if re.search(r"claude-\d", c) and any(kw in c for kw in ["new", "available", "launch", "introduc", "released"]):
+        return "A"
+    if "new model" in c or "introducing claude" in c:
+        return "A"
+    return "B"
+
+
+# ── GitHub releases ────────────────────────────────────────────────────────
 
 def fetch_github_releases() -> int:
     new = 0
@@ -92,37 +179,50 @@ def fetch_github_releases() -> int:
             log.error("GitHub fetch failed (%s): %s", repo, e)
             continue
 
+        # Identify new releases without holding a DB connection during LLM calls
+        new_rels = []
         with _conn() as conn:
             for rel in releases:
                 tag = rel.get("tag_name", "")
-                name = rel.get("name") or tag
-                body = (rel.get("body") or "")[:1000]
-                published_at = rel.get("published_at", "")[:10]
+                existing = conn.execute(
+                    "SELECT id FROM github_releases WHERE repo=? AND tag=?", (repo, tag)
+                ).fetchone()
+                if not existing:
+                    new_rels.append(rel)
+
+        # LLM summarization happens outside the DB connection
+        for rel in new_rels:
+            tag = rel.get("tag_name", "")
+            name = rel.get("name") or tag
+            body = (rel.get("body") or "")[:1000]
+            published_at = rel.get("published_at", "")[:10]
+            urgency = _release_urgency(repo, tag, body)
+            dev_summary = _llm_summarize(f"{repo} {tag}", body)
+
+            with _conn() as conn:
                 try:
                     conn.execute(
                         """INSERT OR IGNORE INTO github_releases
-                               (repo, tag, name, body, published_at)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (repo, tag, name, body, published_at),
+                               (repo, tag, name, body, developer_summary, published_at, urgency)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (repo, tag, name, body, dev_summary, published_at, urgency),
                     )
                     if conn.execute("SELECT changes()").fetchone()[0]:
                         new += 1
-                        log.info("New release: %s %s", repo, tag)
+                        log.info("New release [%s]: %s %s", urgency, repo, tag)
                 except sqlite3.Error as e:
                     log.error("DB insert failed (%s %s): %s", repo, tag, e)
 
     return new
 
 
-# ── Anthropic news via sitemap ────────────────────────────────────────────
+# ── Anthropic news via sitemap ─────────────────────────────────────────────
 
 def _slug_to_title(slug: str) -> str:
-    """Convert URL slug to readable title as fallback."""
     return slug.replace("-", " ").title()
 
 
 def _fetch_article_meta(url: str) -> tuple[str | None, str | None]:
-    """Fetch (og:title, og:description) from an article page."""
     try:
         r = requests.get(url, headers=BROWSER_HEADERS, timeout=REQUEST_TIMEOUT)
         if r.status_code != 200:
@@ -144,24 +244,6 @@ def _fetch_article_meta(url: str) -> tuple[str | None, str | None]:
         return None, None
 
 
-# Positive: must match at least one (checked against slug, case-insensitive)
-_RELEVANT_KEYWORDS = [
-    "claude", "sonnet", "opus", "haiku", "mcp", "model-context-protocol",
-    "tool-use", "computer-use", "artifact", "operator", "claude-code",
-    "extended-thinking", "vision", "multimodal",
-]
-
-# Negative: if ANY of these appear in slug OR title, skip the article
-_SKIP_PATTERNS = [
-    "chooses", "selects", "powers customer", "powers llnl", "increases productivity",
-    "partner network", "economic index", "branches of government", "fedramp",
-    "il4", "il5", "for nonprofits", "for life sciences", "for financial services",
-    "for enterprise", "investment in", "invests", "expands to", "comes to",
-    "joins", "available in brazil", "available in canada", "available in the eu",
-    "available in the uk", "case study",
-]
-
-
 def _is_relevant(slug: str) -> bool:
     s = slug.lower().replace("-", " ")
     if any(skip in s for skip in _SKIP_PATTERNS):
@@ -173,11 +255,10 @@ def _is_relevant_title(title: str) -> bool:
     t = title.lower()
     if any(skip in t for skip in _SKIP_PATTERNS):
         return False
-    return True  # slug already passed positive check
+    return True
 
 
 def fetch_anthropic_news() -> int:
-    """Detect new articles via sitemap; fetch titles from individual pages."""
     try:
         resp = requests.get(SITEMAP_URL, headers=BROWSER_HEADERS, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
@@ -191,7 +272,6 @@ def fetch_anthropic_news() -> int:
     )
     log.info("Sitemap: %d news URLs found", len(all_urls))
 
-    # Find which URLs we haven't stored yet
     with _conn() as conn:
         known = {
             row[0] for row in conn.execute(
@@ -208,120 +288,212 @@ def fetch_anthropic_news() -> int:
     for url in new_urls:
         slug = url.split("/news/")[-1]
 
-        # Pre-filter by slug — no HTTP request for irrelevant articles
         if not _is_relevant(slug):
             entry_hash = _hash("anthropic_news", url)
             with _conn() as conn:
                 conn.execute(
                     """INSERT OR IGNORE INTO changelog_entries
-                           (entry_hash, source, title, date, url, category, notified)
-                       VALUES (?, 'anthropic_news', ?, ?, ?, 'skipped', 1)""",
+                           (entry_hash, source, title, date, url, category, urgency, notified)
+                       VALUES (?, 'anthropic_news', ?, ?, ?, 'skipped', 'B', 1)""",
                     (entry_hash, _slug_to_title(slug), today, url),
                 )
             continue
 
-        # Fetch title + description for relevant articles
         title, summary = _fetch_article_meta(url)
         title = title or _slug_to_title(slug)
 
-        # Secondary filter on real title (slug may have been ambiguous)
         if not _is_relevant_title(title):
             log.info("Skipped after title check: %s", title[:80])
             entry_hash = _hash("anthropic_news", url)
             with _conn() as conn:
                 conn.execute(
                     """INSERT OR IGNORE INTO changelog_entries
-                           (entry_hash, source, title, date, url, category, notified)
-                       VALUES (?, 'anthropic_news', ?, ?, ?, 'skipped', 1)""",
+                           (entry_hash, source, title, date, url, category, urgency, notified)
+                       VALUES (?, 'anthropic_news', ?, ?, ?, 'skipped', 'B', 1)""",
                     (entry_hash, title, today, url),
                 )
             continue
 
         entry_hash = _hash("anthropic_news", url)
+        urgency = _entry_urgency("anthropic_news", (title or "") + " " + (summary or ""))
         with _conn() as conn:
             try:
                 conn.execute(
                     """INSERT OR IGNORE INTO changelog_entries
-                           (entry_hash, source, title, date, url, summary, category)
-                       VALUES (?, 'anthropic_news', ?, ?, ?, ?, 'announcement')""",
-                    (entry_hash, title, today, url, summary),
+                           (entry_hash, source, title, date, url, summary, category, urgency)
+                       VALUES (?, 'anthropic_news', ?, ?, ?, ?, 'announcement', ?)""",
+                    (entry_hash, title, today, url, summary, urgency),
                 )
                 if conn.execute("SELECT changes()").fetchone()[0]:
                     new += 1
-                    log.info("New article: %s", title[:80])
+                    log.info("New article [%s]: %s", urgency, title[:80])
             except sqlite3.Error as e:
                 log.error("DB insert failed (%s): %s", url, e)
 
     return new
 
 
-# ── Docs change detection ─────────────────────────────────────────────────
+# ── API release notes (structured entry parsing) ───────────────────────────
 
-def fetch_docs_changes() -> int:
+def _parse_iso_date(date_str: str) -> str:
+    """Convert 'February 27, 2025' → '2025-02-27'. Falls back to today on failure."""
+    try:
+        normalized = date_str.replace(",", "").strip()
+        return datetime.strptime(normalized, "%B %d %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+_DATE_HEADING_RE = re.compile(
+    r"((?:January|February|March|April|May|June|July|August"
+    r"|September|October|November|December)\s+\d{1,2},?\s+\d{4})",
+    re.IGNORECASE,
+)
+
+
+def _parse_release_note_sections(html: str) -> list[tuple[str, str]]:
+    """Parse dated sections from a release notes page.
+
+    Returns list of (date_str, content_text) pairs.
+    """
+    # Split on h2/h3 opening tags — each piece starts with the heading content
+    parts = re.split(r"<h[23][^>]*>", html)
+    results = []
+
+    for part in parts:
+        # Isolate the heading text (up to </h2> or </h3>)
+        close = re.search(r"</h[23]>", part)
+        if not close:
+            continue
+        heading_raw = part[: close.start()]
+        heading_text = re.sub(r"<[^>]+>", "", heading_raw).strip()
+
+        m = _DATE_HEADING_RE.search(heading_text)
+        if not m:
+            continue
+        date_str = m.group(1)
+
+        # Extract text content after the heading close tag
+        body_html = part[close.end():]
+        # Strip scripts/styles
+        body_html = re.sub(r"<script[^>]*>.*?</script>", "", body_html, flags=re.DOTALL)
+        body_html = re.sub(r"<style[^>]*>.*?</style>", "", body_html, flags=re.DOTALL)
+        # Tags → spaces, decode basic entities
+        content = re.sub(r"<[^>]+>", " ", body_html)
+        content = re.sub(r"&nbsp;", " ", content)
+        content = re.sub(r"&amp;", "&", content)
+        content = re.sub(r"&lt;", "<", content)
+        content = re.sub(r"&gt;", ">", content)
+        content = re.sub(r"\s+", " ", content).strip()
+
+        if content:
+            results.append((date_str, content[:600]))
+
+    return results
+
+
+def fetch_release_note_entries() -> int:
     new = 0
-    for url in DOCS_URLS:
+
+    for url in RELEASE_NOTE_URLS:
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+            resp = requests.get(url, headers=BROWSER_HEADERS, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
         except Exception as e:
-            log.error("Docs fetch failed (%s): %s", url, e)
+            log.error("Release notes fetch failed (%s): %s", url, e)
             continue
 
-        # Strip scripts/styles/attrs to avoid hashing dynamic session data
-        stable_text = re.sub(r'<script[^>]*>.*?</script>', '', resp.text, flags=re.DOTALL)
-        stable_text = re.sub(r'<style[^>]*>.*?</style>', '', stable_text, flags=re.DOTALL)
-        stable_text = re.sub(r'<[^>]+>', '', stable_text)
-        stable_text = re.sub(r'\s+', ' ', stable_text).strip()
-        content_hash = hashlib.sha256(stable_text.encode()).hexdigest()[:32]
-        now = datetime.now(timezone.utc).isoformat()
+        sections = _parse_release_note_sections(resp.text)
+        if not sections:
+            log.warning(
+                "Release notes %s: 0 sections found — page may be JS-rendered or structure changed",
+                url.split("/")[-1],
+            )
+            continue
+        log.info("Release notes %s: %d sections found", url.split("/")[-1], len(sections))
 
-        with _conn() as conn:
-            existing = conn.execute(
-                "SELECT content_hash FROM docs_snapshots WHERE url=?", (url,)
-            ).fetchone()
+        for date_str, content in sections:
+            entry_hash = _hash("release_notes", url, date_str)
+            urgency = _entry_urgency("release_notes", content)
+            iso_date = _parse_iso_date(date_str)
 
-            if existing is None:
-                # First time seeing this URL — store snapshot, no notification
-                conn.execute(
-                    "INSERT INTO docs_snapshots (url, content_hash, checked_at) VALUES (?, ?, ?)",
-                    (url, content_hash, now),
-                )
-                log.info("Docs baseline stored: %s", url)
+            # Build a concise title from the first meaningful phrase
+            first_sentence = re.split(r"[.!?\n]", content)[0].strip()[:100]
+            title = first_sentence if first_sentence else f"API update · {date_str}"
 
-            elif existing["content_hash"] != content_hash:
-                # Content changed — update snapshot and add changelog entry
-                conn.execute(
-                    "UPDATE docs_snapshots SET content_hash=?, checked_at=? WHERE url=?",
-                    (content_hash, now, url),
-                )
-                entry_hash = _hash("docs_change", url, content_hash)
-                page = url.split("/")[-1].replace("-", " ").title()
-                title = f"Docs updated: {page}"
-                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-                conn.execute(
-                    """INSERT OR IGNORE INTO changelog_entries
-                           (entry_hash, source, title, date, url, category)
-                       VALUES (?, 'docs', ?, ?, ?, 'docs')""",
-                    (entry_hash, title, today, url),
-                )
-                if conn.execute("SELECT changes()").fetchone()[0]:
-                    new += 1
-                    log.info("Docs changed: %s", url)
-            else:
-                log.info("Docs unchanged: %s", url)
+            with _conn() as conn:
+                try:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO changelog_entries
+                               (entry_hash, source, title, date, url, summary, category, urgency)
+                           VALUES (?, 'release_notes', ?, ?, ?, ?, 'api_update', ?)""",
+                        (entry_hash, title, iso_date, url, content[:300], urgency),
+                    )
+                    if conn.execute("SELECT changes()").fetchone()[0]:
+                        new += 1
+                        log.info("New release note [%s]: %s — %s", urgency, date_str, title[:60])
+                except sqlite3.Error as e:
+                    log.error("DB insert failed (release note %s): %s", date_str, e)
 
     return new
 
 
-# ── Main ──────────────────────────────────────────────────────────────────
+# ── Anthropic status page ──────────────────────────────────────────────────
+
+def fetch_status_page() -> int:
+    try:
+        resp = requests.get(STATUS_API, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        log.error("Status page fetch failed: %s", e)
+        return 0
+
+    incidents = data.get("incidents", [])
+    if not incidents:
+        log.info("Status page: no active incidents")
+        return 0
+
+    new = 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    with _conn() as conn:
+        for inc in incidents:
+            inc_id = inc.get("id", "")
+            name = inc.get("name", "Unknown incident")
+            shortlink = inc.get("shortlink", "https://status.anthropic.com")
+            updates = inc.get("incident_updates", [])
+            summary = updates[0].get("body", "")[:300] if updates else ""
+
+            entry_hash = _hash("status", inc_id)
+            title = f"API Incident: {name}"
+
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO changelog_entries
+                           (entry_hash, source, title, date, url, summary, category, urgency)
+                       VALUES (?, 'status', ?, ?, ?, ?, 'incident', 'A')""",
+                    (entry_hash, title, today, shortlink, summary),
+                )
+                if conn.execute("SELECT changes()").fetchone()[0]:
+                    new += 1
+                    log.info("New incident [A]: %s", name)
+            except sqlite3.Error as e:
+                log.error("DB insert failed (incident %s): %s", inc_id, e)
+
+    return new
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
 
 def main():
     log.info("=== fetch_updates starting ===")
 
     total = 0
+    total += fetch_status_page()        # Check incidents first (highest priority)
     total += fetch_github_releases()
     total += fetch_anthropic_news()
-    total += fetch_docs_changes()
+    total += fetch_release_note_entries()
 
     log.info("=== fetch_updates done: %d new items ===", total)
 

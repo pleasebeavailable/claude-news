@@ -66,6 +66,7 @@ def _init_db():
                 url TEXT,
                 summary TEXT,
                 category TEXT,
+                urgency TEXT DEFAULT 'B',
                 capabilities TEXT,
                 relevance_score INTEGER,
                 fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -82,7 +83,9 @@ def _init_db():
                 tag TEXT NOT NULL,
                 name TEXT,
                 body TEXT,
+                developer_summary TEXT,
                 published_at TEXT,
+                urgency TEXT DEFAULT 'B',
                 fetched_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 notified BOOLEAN DEFAULT 0,
                 UNIQUE(repo, tag)
@@ -93,14 +96,22 @@ def _init_db():
                 text TEXT NOT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-
-            CREATE TABLE IF NOT EXISTS docs_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                url TEXT UNIQUE NOT NULL,
-                content_hash TEXT NOT NULL,
-                checked_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            );
         """)
+        # Migrate existing tables — safe to run repeatedly
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    migrations = [
+        ("changelog_entries", "urgency", "TEXT DEFAULT 'B'"),
+        ("github_releases", "urgency", "TEXT DEFAULT 'B'"),
+        ("github_releases", "developer_summary", "TEXT"),
+    ]
+    for table, col, col_def in migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 
 _init_db()
@@ -119,33 +130,132 @@ def _truncate(text: str, limit: int = _MAX_TELEGRAM) -> str:
     return text[:limit - 20] + "\n\n... (truncated)"
 
 
-def _entry_date(row) -> str:
-    raw = row["date"] or row["fetched_at"] or ""
-    if len(raw) >= 10:
-        d = raw[:10]
-        try:
-            dt = datetime.strptime(d, "%Y-%m-%d")
-            return dt.strftime("%b %d")
-        except ValueError:
-            return d
-    return "?"
-
-
 def _source_icon(source: str) -> str:
     icons = {
         "anthropic_news": "\U0001f4f0",
+        "release_notes": "\U0001f195",
+        "status": "\U0001f6a8",
         "github_release": "\U0001f527",
         "github_commit": "\U0001f50c",
-        "docs": "\U0001f4d6",
         "manual": "\u270f\ufe0f",
     }
     return icons.get(source, "\U0001f4cb")
 
 
+def _tier_a_icon_for_entry(row) -> str:
+    category = (row["category"] or "").lower()
+    source = (row["source"] or "").lower()
+    summary = (row["summary"] or "").lower()
+    title = (row["title"] or "").lower()
+    combined = summary + " " + title
+    if category == "incident" or source == "status":
+        return "\U0001f6a8"  # 🚨
+    if any(p in combined for p in ["breaking", "deprecated", "removed ", "migration"]):
+        return "\u26a0\ufe0f"  # ⚠️
+    if source == "release_notes":
+        return "\U0001f195"  # 🆕
+    return "\U0001f4e3"  # 📣
+
+
+def _tier_a_icon_for_release(row) -> str:
+    body = (row["body"] or "").lower()
+    repo = (row["repo"] or "")
+    if any(p in body for p in ["breaking change", "breaking:", "deprecated", "removed "]):
+        return "\u26a0\ufe0f"  # ⚠️
+    if "claude-code" in repo:
+        return "\U0001f527"  # 🔧
+    return "\U0001f195"  # 🆕
+
+
 # ── Core functions ───────────────────────────────────────────────────
 
+def _send_tier_a_entry(row) -> None:
+    """Send a single Tier A changelog entry as its own Telegram message."""
+    icon = _tier_a_icon_for_entry(row)
+    title = _escape_md(row["title"])
+    summary = (row["summary"] or "")[:220]
+    url = row["url"] or ""
+
+    lines = [f"{icon} *{title}*"]
+    if summary:
+        lines.append(f"_{_escape_md(summary)}_")
+    if url:
+        lines.append(url)
+
+    telegram_bot.send("\n".join(lines))
+
+
+def _send_tier_a_release(row) -> None:
+    """Send a single Tier A GitHub release as its own Telegram message."""
+    r = dict(row)
+    icon = _tier_a_icon_for_release(row)
+    repo_short = r["repo"].split("/")[-1]
+    tag = r["tag"]
+    title = _escape_md(f"{repo_short} {tag}")
+
+    summary = r.get("developer_summary") or ""
+    if not summary and r.get("body"):
+        # Fall back to first meaningful line of release body
+        for line in r["body"].strip().splitlines():
+            line = line.strip().lstrip("#- ")
+            if len(line) > 20:
+                summary = line[:220]
+                break
+
+    url = f"https://github.com/{r['repo']}/releases/tag/{r['tag']}"
+
+    lines = [f"{icon} *{title}*"]
+    if summary:
+        lines.append(f"_{_escape_md(summary)}_")
+    lines.append(url)
+
+    telegram_bot.send("\n".join(lines))
+
+
+def _send_tier_b_digest(entries, releases) -> None:
+    """Send a compact digest of Tier B (non-urgent) updates."""
+    today = datetime.now(timezone.utc).strftime("%b %d")
+    total = len(entries) + len(releases)
+    lines = [f"*{total} update{'s' if total != 1 else ''} \u00b7 {today}*", "\u2501" * 19]
+
+    shown = 0
+    for row in entries[:_MAX_DIGEST]:
+        icon = _source_icon(row["source"])
+        title = (row["title"] or "")[:60]
+        snippet = (row["summary"] or "")[:80]
+        if snippet:
+            lines.append(f"{icon} {_escape_md(title)} \u2014 {_escape_md(snippet)}")
+        else:
+            lines.append(f"{icon} {_escape_md(title)}")
+        shown += 1
+
+    for row in releases[:max(0, _MAX_DIGEST - shown)]:
+        r = dict(row)
+        repo_short = r["repo"].split("/")[-1]
+        tag = r["tag"]
+        snippet = r.get("developer_summary") or ""
+        if not snippet and r.get("body"):
+            for line in r["body"].strip().splitlines():
+                line = line.strip().lstrip("#- ")
+                if len(line) > 20:
+                    snippet = line[:80]
+                    break
+        if snippet:
+            lines.append(f"\U0001f527 {_escape_md(repo_short)} {_escape_md(tag)} \u2014 {_escape_md(snippet)}")
+        else:
+            lines.append(f"\U0001f527 {_escape_md(repo_short)} {_escape_md(tag)}")
+        shown += 1
+
+    remaining = total - shown
+    if remaining > 0:
+        lines.append(f"_...and {remaining} more_")
+    lines.append("\n`changelog` for details")
+
+    telegram_bot.send(_truncate("\n".join(lines)))
+
+
 def process_sync() -> None:
-    """Process unnotified entries and send Telegram digest."""
+    """Process unnotified entries and send tiered Telegram notifications."""
     with _conn() as conn:
         entries = conn.execute(
             "SELECT * FROM changelog_entries WHERE notified=0 AND category != 'skipped' ORDER BY date DESC"
@@ -161,37 +271,28 @@ def process_sync() -> None:
 
     logger.info("process_sync: %d entries, %d releases to notify", len(entries), len(releases))
 
-    lines = ["*New Claude Updates*", "\u2501" * 19]
+    tier_a_entries = [r for r in entries if (r["urgency"] or "B") == "A"]
+    tier_b_entries = [r for r in entries if (r["urgency"] or "B") != "A"]
+    tier_a_releases = [r for r in releases if (r["urgency"] or "B") == "A"]
+    tier_b_releases = [r for r in releases if (r["urgency"] or "B") != "A"]
 
-    shown = 0
-    for row in entries[:_MAX_DIGEST]:
-        icon = _source_icon(row["source"])
-        date = _entry_date(row)
-        title = _escape_md(row["title"])
-        summary = ""
-        if row["summary"]:
-            summary = "\n  _" + _escape_md(row["summary"][:180]) + "_"
-        lines.append(f"{icon} *{title}*{summary}")
-        shown += 1
+    logger.info(
+        "Tier A: %d entries + %d releases | Tier B: %d entries + %d releases",
+        len(tier_a_entries), len(tier_a_releases),
+        len(tier_b_entries), len(tier_b_releases),
+    )
 
-    for row in releases[:max(0, _MAX_DIGEST - shown)]:
-        date = (row["published_at"] or "")[:10]
-        repo = row["repo"].split("/")[-1]
-        tag = _escape_md(row["tag"])
-        body = ""
-        if row["body"]:
-            first_line = row["body"].strip().splitlines()[0][:180]
-            body = "\n  _" + _escape_md(first_line) + "_"
-        lines.append(f"\U0001f527 *{_escape_md(repo)} {tag}* `{date}`{body}")
-        shown += 1
+    # Tier A: one message per item
+    for row in tier_a_entries:
+        _send_tier_a_entry(row)
+    for row in tier_a_releases:
+        _send_tier_a_release(row)
 
-    remaining = total - shown
-    if remaining > 0:
-        lines.append(f"\n_...and {remaining} more — send `changelog` to see all_")
+    # Tier B: single digest
+    if tier_b_entries or tier_b_releases:
+        _send_tier_b_digest(tier_b_entries, tier_b_releases)
 
-    msg = _truncate("\n".join(lines))
-    telegram_bot.send(msg)
-
+    # Mark everything notified
     with _conn() as conn:
         entry_ids = [r["id"] for r in entries]
         release_ids = [r["id"] for r in releases]
@@ -263,7 +364,6 @@ def search_capability(query: str) -> str:
         lines = [f"*Claude: {_escape_md(query)}*", "\u2501" * 19]
         for row in rows:
             icon = _source_icon(row["source"])
-            date = _entry_date(row)
             title = _escape_md(row["title"])
             summary = ""
             if row["summary"]:
@@ -275,7 +375,7 @@ def search_capability(query: str) -> str:
                     caps = "\n  Tags: " + ", ".join(cap_list[:5])
                 except (json.JSONDecodeError, TypeError):
                     pass
-            lines.append(f"{icon} [{date}] *{title}*{summary}{caps}")
+            lines.append(f"{icon} *{title}*{summary}{caps}")
         return _truncate("\n".join(lines))
 
     logger.info("search_capability(%s): no DB matches, asking Claude", query)
