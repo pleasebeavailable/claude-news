@@ -4,6 +4,7 @@ import logging
 import logging.handlers
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -153,11 +154,30 @@ def handle_message(text: str) -> str:
 
 # ── Sync trigger checker ────────────────────────────────────────────
 _TRIGGER_PATH = os.path.join(os.path.dirname(__file__), "data", ".sync_trigger")
+_LAST_FETCH_PATH = os.path.join(os.path.dirname(__file__), "data", ".last_fetch_time")
+_FETCH_SCRIPT = os.path.join(os.path.dirname(__file__), "bin", "fetch_updates.py")
+_FETCH_INTERVAL = 6 * 3600  # 6 hours
+
+
+def _read_last_fetch() -> float:
+    try:
+        with open(_LAST_FETCH_PATH) as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0.0
 
 
 def _sync_checker():
-    """Background thread: check for sync trigger every 30s."""
+    """Background thread: catch-up fetch on wake + process sync trigger every 30s."""
     while True:
+        elapsed = time.time() - _read_last_fetch()
+        if elapsed > _FETCH_INTERVAL:
+            logger.info("%.1fh since last fetch — running catch-up", elapsed / 3600)
+            try:
+                subprocess.run([sys.executable, _FETCH_SCRIPT], timeout=120, check=False)
+            except Exception as e:
+                logger.error("Catch-up fetch failed: %s", e)
+
         if os.path.exists(_TRIGGER_PATH):
             try:
                 claude_changelog.process_sync()
@@ -165,6 +185,7 @@ def _sync_checker():
                 logger.info("Processed sync trigger")
             except Exception as e:
                 logger.error("Sync trigger failed: %s", e)
+
         time.sleep(30)
 
 

@@ -10,6 +10,7 @@ import logging
 import re
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import requests
 ROOT = Path(__file__).parent.parent
 DB_PATH = ROOT / "data" / "claude_knowledge.db"
 TRIGGER_PATH = ROOT / "data" / ".sync_trigger"
+LAST_FETCH_PATH = ROOT / "data" / ".last_fetch_time"
 LOG_PATH = ROOT / "logs" / "fetch.log"
 
 # ── Sources ───────────────────────────────────────────────────────────────
@@ -322,6 +324,9 @@ def main():
     total += fetch_docs_changes()
 
     log.info("=== fetch_updates done: %d new items ===", total)
+
+    LAST_FETCH_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAST_FETCH_PATH.write_text(str(time.time()))
 
     if total > 0:
         TRIGGER_PATH.parent.mkdir(parents=True, exist_ok=True)
